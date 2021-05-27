@@ -1,0 +1,498 @@
+#!/usr/bin/perl -w
+
+
+
+# CHANGE LOG
+# ----------
+#  2009/03/09	Nick Jeffrey	Script created
+#  2009/06/19	Nick Jeffrey	Add paging_space_size_sanity_check subroutine
+#  2011/03/05	Nick Jeffrey	Add verbose flag for debugging
+#  2011/03/05	Nick Jeffrey	Fix bug in regexp looking for PP SIZE
+#  2011/03/05	Nick Jeffrey	Add more descriptive warning messages
+#  2012/12/25	Nick Jeffrey	Add nagios perfdata to output
+#  2013/03/22	Nick Jeffrey	If there is more than 32GB of physical memory, do not ask for more than 32GB of paging space
+#  2013/03/22	Nick Jeffrey	Move the pagein/pageout activity alert higher than the paging space consumption alert (more important alerts first)
+#  2013/03/22	Nick Jeffrey	Change alert message if there is high paging space usage but very little actual paging activity
+#  2015/11/09	Nick Jeffrey	Typo in alert message
+#  2016/05/24	Nick Jeffrey	Confirm all paging spaces are located on rootvg
+#  2016/05/24	Nick Jeffrey	Add get_options subroutine
+#  2016/05/24	Nick Jeffrey	Confirm hd6 paging space is at least 512MB
+
+
+
+
+#
+# Nagios plugin for checking AIX paging space utilization and paging in/out rates
+
+# NOTES
+# -----
+#  This script should return one (and only one) line of ouput.  Multiple
+#  lines of output are silently ignored by nagios.
+# 
+#  The line of output will become the body of the alert message sent by nagios
+#
+#  
+#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh
+#  methods available in nagios.  
+#
+#  If you are using the check_by_ssh method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#      define service {
+#              use                             generic-24x7-service
+#              hostgroup_name                  all_aix
+#              service_description             AIX paging
+#              check_command                   check_by_ssh!/usr/local/nagios/libexec/check_aix_paging
+#              }
+#
+#
+#  Alternatively, if you are using the NRPE method, you should have a section similar to the following in 
+#  the services.cfg file:
+#      define service{
+#               use                             generic-24x7-service
+#               hostgroup_name                  all_aix
+#               service_description             AIX paging
+#               check_command                   check_nrpe!check_aix_paging -t 30
+#               notification_options            c,r                     ; Send notifications about critical and recovery events
+#  If you are using the NRPE method, you will also need a command definition similar to the following on each monitored host
+#  in the /usr/local/nagios/nrpe/nrpe.cfg file:
+#      command[check_aix_misc]=/usr/local/nagios/libexec/check_aix_paging
+#
+#
+#
+#
+#  Please note that the default thresholds for alerting are as follows:
+#        WARN on page space utilization 50%
+#        CRIT on page space utilization 70%
+#        WARN on pagein/pageout activity  50 pages/sec
+#        CRIT on pagein/pageout activity 100 pages/sec
+#  If you want to specify a custom threshold for a particular host, you can pass the values as command line parameters.
+#  For example, if you wanted to warn on 60% space util and critical on 80%, with 75 pageins/sec and critical on 150 pageins/sec,
+#  the section in the services.cfg would look something like this:
+#      define service {
+#              use                             generic-24x7-service
+#              host_name                       my_aix_server
+#              service_description             AIX paging
+#              check_command                   check_by_ssh!/usr/local/nagios/libexec/check_aix_paging!60!80!75!150
+#              }
+
+ 
+
+use strict;						#enforce good coding practices
+use Getopt::Long;                       		#allow --long-switches to be used as parameters
+
+
+# define variables
+my ($lsps,$lsattr,$vmstat,$vmstat_interval,$realmemory);
+my ($thresh_warn_space,$thresh_crit_space,$thresh_warn_rate,$thresh_crit_rate); 
+my ($pagingspace,$pagingutil,$pagingused,$pagein1,$pageout1,$pagein2,$pageout2,$pageinrate,$pageoutrate);
+my ($memsize,$ppsize,$lsvg,$additionalpps,$common_output_data,$perf_data,$verbose);
+my ($opt_h,$opt_v,$opt_w,$opt_c);
+my (%pagefiles,$key);
+my ($CHECK_NAME,$OK,$WARN,$CRITICAL,$UNKNOWN); 
+
+
+#define name of nagios check
+$CHECK_NAME="AIX paging";				#define name of nagios check
+
+#
+# define variables
+#
+$lsps                = "/usr/sbin/lsps";		#location of lsps binary
+$lsvg                = "/usr/sbin/lsvg";		#location of lsvg binary
+$lsattr              = "/usr/sbin/lsattr";		#location of lsattr binary
+$vmstat              = "/usr/bin/vmstat";		#location of vmstat binary
+$vmstat_interval     = 5;				#seconds to wait between using vmstat to gather pagein / pageout
+$realmemory          = 0;				#amount of real memory 
+$thresh_warn_space   = 50;				#default threshold for warning  on % paging space util
+$thresh_crit_space   = 70;				#default threshold for critical on % paging space util
+$thresh_warn_rate    = 50;				#default threshold for warning  on paging in/out rates
+$thresh_crit_rate    = 100;				#default threshold for critical on paging in/out rates
+$pagingspace         = "";				#total paging space in MB
+$pagingutil          = "";				#paging space utilized in %
+$pagingused          = "";				#paging space used in MB		
+$pagein1             = "";				#value captured from output of vmstat command
+$pageout1            = "";				#value captured from output of vmstat command
+$pagein2             = "";				#value captured from output of vmstat command
+$pageout2            = "";				#value captured from output of vmstat command
+$pageinrate          = "";				#how many pageins happen each interval
+$pageoutrate         = "";				#how many pageouts happen each interval
+$ppsize              = "";				#size of physical partitions
+$memsize	     = "";				#size of physical memory
+$additionalpps       = "";				#number of additional Physical Partitions needed to bring paging space to a sane size
+$common_output_data  = "";				#nagios performance data included in output
+$perf_data           = "";				#nagios performance data included in output
+$verbose	     = "no";				#yes/no flag for verbose output for debugging
+#
+# Nagios return codes - this script returns a value to nagios for processing
+#
+$OK=0;
+$WARN=1;
+$CRITICAL=2;
+$UNKNOWN=3;
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   #
+   print "running get_options subroutine \n" if ($verbose eq "yes");
+   #
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"        => \$opt_h,
+      "v"   => \$opt_v, "verbose"     => \$opt_v,
+      "w=s" => \$opt_w, "warn=s"      => \$opt_w,  "warning=s"  => \$opt_w,
+      "c=s" => \$opt_c, "crit=s"      => \$opt_c,  "critical=s" => \$opt_c,
+   );
+   #
+   #
+   #
+   # If the user supplied -h or --help, generate the help messages
+   if( defined( $opt_h ) ) {
+      print "Nagios plugin for determining filesystem usage. \n";
+      print "Examples: \n";
+      print "   $0 --help    \n";
+      print "   $0 --verbose \n";
+      print "   $0 --warn= --critical= \n";
+      print "\n\n";
+      exit $UNKNOWN;
+   }
+   #
+   #
+   # If the user supplied -v or --verbose switch, increase script output verbosity for debugging
+   if( defined( $opt_v ) ) {
+      $verbose = "yes";
+   }
+   #
+   # If the user did not supply a -w or --warn== value, use the default
+   #
+   if( defined( $opt_w ) ) {
+      $thresh_warn_space = $opt_w;
+   } else {
+      $thresh_warn_space = 50;
+   }
+   #
+   # If the user did not supply a -c or --critical= value, use the default
+   #
+   if( defined( $opt_c ) ) {
+      $thresh_crit_space = $opt_c;
+   } else {
+      $thresh_crit_space = 70;
+   }
+
+}                       #end of subroutine
+
+
+sub sanity_checks {
+   #
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm required files exist and are executable
+   #
+   $_ = $lsps;
+   if ( ! -e "$_" ) {  print "$CHECK_NAME UNKNOWN required file $_ not found \n"                            ; exit $UNKNOWN; }
+   if ( ! -x "$_" ) {  print "$CHECK_NAME UNKNOWN required file $_ is not executable by the nagios user \n" ; exit $UNKNOWN; }
+   $_ = $lsattr;
+   if ( ! -e "$_" ) {  print "$CHECK_NAME UNKNOWN required file $_ not found \n"                            ; exit $UNKNOWN; }
+   if ( ! -x "$_" ) {  print "$CHECK_NAME UNKNOWN required file $_ is not executable by the nagios user \n" ; exit $UNKNOWN; }
+   $_ = $lsvg;
+   if ( ! -e "$_" ) {  print "$CHECK_NAME UNKNOWN required file $_ not found \n"                            ; exit $UNKNOWN; }
+   if ( ! -x "$_" ) {  print "$CHECK_NAME UNKNOWN required file $_ is not executable by the nagios user \n" ; exit $UNKNOWN; }
+}								#end of subroutine
+
+
+
+
+sub paging_space_size_sanity_check {
+   #
+   print "running paging_space_size_sanity_check subroutine \n" if ($verbose eq "yes");
+   #
+   # This subroutine checks the size of the paging space and makes sure it is a sane value.
+   # By default, AIX 5.3 creates a 512MB paging space.  This is woefully small for nearly all workloads.
+   # Ensure the paging space is at least the size of physical memory.
+   #
+   #
+   # Get the size of physical memory
+   #
+   open (IN,"$lsattr -El mem0 |"); 				#open filehandle using command output
+   while (<IN>) {    						#read a line from the filehandle
+      if ( /^size +([0-9]+)/ ) {  				#look for memory size
+         $memsize = $1;						#find memory size (in megabytes)
+         print "   memsize is $memsize MB \n" if ($verbose eq "yes");
+      }            						#end of if block
+   }                        					#end of while loop
+   #
+   # Get the physical partition size
+   # We only use this to tell the sysadmin how much the paging space needs to be increased by
+   #
+   open (IN,"$lsvg rootvg |"); 					#open filehandle using command output
+   while (<IN>) {    						#read a line from the filehandle
+      if ( /PP SIZE: +([0-9]+)/ ) {  				#look for memory size
+         $ppsize = $1;						#find memory size (in megabytes)
+         print "   ppsize is $ppsize MB \n" if ($verbose eq "yes");
+      }            						#end of if block
+   }                        					#end of while loop
+   close IN;							#close filehandle   
+   #
+   # Get the size of the paging space
+   #
+   open (IN,"$lsps -s |"); 					#open filehandle using command output
+   while (<IN>) {           					#read a line from the filehandle
+      if ( /^ +([0-9]+)MB +([0-9]+)%/ ) { 			#look for paging space size and % util
+         $pagingspace = $1;					#save paging space size (in MB) in a variable
+         print "   pagingspace is $pagingspace MB \n" if ($verbose eq "yes");
+      }      							#end of if block
+   }             						#end of while loop
+   close IN;          						#close filehandle
+}								#end of subroutine
+
+
+
+
+
+
+sub check_paging_space_util {
+   #
+   print "running check_paging_space_util subroutine \n" if ($verbose eq "yes");
+   #
+   # Get the amount of real memory 
+   #
+   open (IN,"$lsattr -El mem0 |");                 		#open filehandle using command output
+   while (<IN>) {    						#read a line from the filehandle
+      if ( /^size +([0-9]+)/ ) {  				#look for memory size
+         $realmemory = $1;					#save memory size in a variable
+      }            						#end of if block
+   }                        					#end of while loop
+   close IN; 							#close filehandle
+   #
+   # Get the size of the paging space
+   #
+   open (IN,"$lsps -s |"); 					#open filehandle using command output
+   while (<IN>) {           					#read a line from the filehandle
+      if ( /^ +([0-9]+)MB +([0-9]+)%/ ) { 			#look for paging space size and % util
+         $pagingspace = $1;					#save paging space size (in MB) in a variable
+         $pagingutil  = $2; 					#save paging space % util in a variable
+         $pagingused = $pagingspace * $pagingutil / 100;	#figure out MB of used paging space
+         $pagingused = int($pagingused);			#remove anything after decimal point (MB is close enough)
+      }      							#end of if block
+   }             						#end of while loop
+   close IN;          						#close filehandle
+}								#end of subroutine
+
+
+
+
+
+
+sub check_pagein_pageout_rate {
+   #
+   print "running check_pagein_pageout_rate subroutine \n" if ($verbose eq "yes");
+   #
+   # Check to see if excessive paging is occurring
+   #
+   # Get initial pagein/pageout values
+   #
+   open (IN,"$vmstat -s |");     				#open filehandle using command output
+   while (<IN>) {                                               #read a line from the filehandle
+      if ( /([0-9]+) paging space page ins/ ) {  		#look for paging space page ins value
+         $pagein1 = $1;        					#capture pageins for later processing
+      }                                                         #end of if block
+      if ( /([0-9]+) paging space page outs/ ) {  		#look for paging space page outs value
+         $pageout1 = $1;       					#capture pageouts for later processing
+      }                                                         #end of if block
+   }                                                            #end of while loop
+   close IN;                                                    #close filehandle
+   # 
+   # Wait for a while so we can get another pagein/pageout value for comparison
+   #
+   sleep ($vmstat_interval);
+   #
+   # Get another set of pagein/pageout values to compare against the first one
+   #
+   open (IN,"$vmstat -s |");     				#open filehandle using command output
+   while (<IN>) {                                               #read a line from the filehandle
+      if ( /([0-9]+) paging space page ins/ ) {  		#look for paging space page ins value
+         $pagein2 = $1;        					#capture pageins for later processing
+      }                                                         #end of if block
+      if ( /([0-9]+) paging space page outs/ ) {  		#look for paging space page outs value
+         $pageout2 = $1;       					#capture pageouts for later processing
+      }                                                         #end of if block
+   }                                                            #end of while loop
+   close IN;                                                    #close filehandle
+   #
+   # Calculate pagein/pageout rates
+   #
+   $pageinrate  = ($pagein2  - $pagein1 ) / $vmstat_interval;
+   $pageoutrate = ($pageout2 - $pageout1) / $vmstat_interval;
+}								#end of subroutine
+
+
+
+
+sub check_volume_groups {
+   #
+   print "running check_volume_groups subroutine \n" if ($verbose eq "yes");
+   #
+   # Confirm that all the paging spaces are located on rootvg
+   #
+   #  Example command output:
+   #  lsps -a
+   #  Page Space      Physical Volume   Volume Group Size    %Used Active  Auto  Type Chksum
+   #  hd6             hdisk0            rootvg       16384MB     7   yes   yes    lv     0
+   #  paging00        hdisk4            pagingvg      4096MB     0   yes   yes    lv     0
+   #  paging01        hdisk4            pagingvg      2048MB     0   yes   yes    lv     0
+   # 
+   #
+   open (IN,"$lsps -a |");   					#open filehandle using command output
+   while (<IN>) {                                               #read a line from the filehandle
+      next if (/^Page Space/); 					#skip header row
+      if ( /([a-zA-Z0-9]+) +(hdisk[0-9]+) +([a-zA-Z0-9]+) +([0-9]+)MB/ ) {	#look for paging space and volume group
+         $pagefiles{$1}{name}     = $1;				#add to hash
+         $pagefiles{$1}{hdisk}    = $2;				#add to hash
+         $pagefiles{$1}{volgroup} = $3;				#add to hash
+         $pagefiles{$1}{size}     = $4;				#add to hash
+      }                                                         #end of if block
+   }                                                            #end of while loop
+   close IN;                                                    #close filehandle
+   if ($verbose eq "yes") {
+      foreach $key (sort keys %pagefiles) {			#loop through for all paging spaces
+         print "   paging_space:$pagefiles{$key}{name} hdisk:$pagefiles{$key}{hdisk} volume_group:$pagefiles{$key}{volgroup} size:$pagefiles{$key}{size}MB \n";
+      } 							#end of foreach block
+   } 								#end of if block
+}								#end of subroutine
+
+
+
+
+
+
+
+sub print_output {
+   #
+   print "running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   # The nagios performance data will be the same for all the outputs, so just put it in a variable that can be use by all the output options
+   # The format is:  label=value[UOM];[warn];[crit];[min];[max]
+   # On the "label=value" section is required.  The warn|crit|min|max entries are optional.
+   # You can have multiple items of perf data, just separate each section with a space
+   # UOM is Units Of Measurement.    Can be s=seconds B=bytes MB=megabytes %=percent c=counter
+   $perf_data = "RealMemory=${memsize}MB;;;; PagingSpace=${pagingspace}MB;;;; PagingUtil=${pagingutil}%;${thresh_warn_space}%;${thresh_crit_space}%;0%;100% PageInSec=${pageinrate};${thresh_warn_rate};${thresh_crit_rate};; PageOutSec=${pageoutrate};${thresh_warn_rate};${thresh_crit_rate};;";
+   #
+   #
+   #
+   # Much of the text of the output will be the same.  Put the common stuff in a variable so we can simplify the outputs
+   $common_output_data = "${pagingutil}% used (${pagingused}MB / ${pagingspace}MB). RealMemory=${realmemory}MB  Pagein/sec=$pageinrate  Pageout/sec=$pageoutrate";
+   #
+   # Confirm paging space size is a sane value.
+   # What is a sane value?  Well, that is a bit subjective.
+   # We're going to say that for AIX hosts with up to 4GB of RAM,
+   # we want to see twice the paging space as physical memory.
+   # For systems with more than 4GB RAM, we want to see a paging
+   # space at least equal to physical memory.
+   #
+   if ( $memsize <= 4096 ) {					#run this section if up to 4GB RAM
+      if ( $pagingspace < ($memsize*2) ) {
+         $additionalpps = ( ($memsize * 2  / $ppsize) - ($pagingspace / $ppsize) );	#figure how how much bigger to make paging space
+         print "$CHECK_NAME WARN - Paging space size too small.  For systems with up to 4GB RAM, we like to see paging space at least twice the size of RAM. Please make paging space at least twice the size of physical memory with this command: chps -s $additionalpps hd6       $common_output_data | $perf_data \n";
+         exit $WARN;     
+      }								#end of if block
+   }								#end of if block			
+   #
+   if ( ($memsize > 4096) &&  ($memsize <= 32768) ) {		#run this section if more than 4GB but less than 32GB
+      if ( $pagingspace < $memsize ) {
+         $additionalpps = ( ($memsize / $ppsize) - ($pagingspace / $ppsize) );	#figure how how much bigger to make paging space
+         print "$CHECK_NAME WARN - Paging space size too small.  Please make paging space at least the size of physical memory with this command: chps -s $additionalpps hd6    $common_output_data | $perf_data \n";
+         exit $WARN;     
+      }								#end of if block
+   }								#end of if block			
+   #
+   if ( $memsize > 32768 ) {					#run this section if more 32GB
+      if ( $pagingspace < 32768 ) {				#only alert if paging space is less than 32GB
+         $additionalpps = ( (32768 / $ppsize) - ($pagingspace / $ppsize) );	#figure how how much bigger to make paging space
+         print "$CHECK_NAME WARN - Paging space size too small.  Please make paging space at least 32GB with this command: chps -s $additionalpps hd6    $common_output_data | $perf_data \n";
+         exit $WARN;     
+      }								#end of if block
+   }								#end of if block			
+   #
+   # Send an alert if a paging rate utilization threshold is exceeded
+   #
+   if ( ($pageinrate > $thresh_crit_rate) || ($pageoutrate > $thresh_crit_rate) ) {
+      print "$CHECK_NAME CRITICAL - Excessive page-in rates.  Performance is suffering due to high paging activity.   $common_output_data | $perf_data \n";
+      exit $CRITICAL;						#exit script
+   }								 
+   if ( ($pageinrate > $thresh_warn_rate) || ($pageoutrate > $thresh_warn_rate) ) {
+      print "$CHECK_NAME WARN - Excessive paging rates.   $common_output_data | $perf_data  \n";
+      exit $WARN;						#exit script
+   }								 
+   #
+   # Send an alert if a paging space utilization threshold is exceeded
+   #
+   if ( $pagingutil > $thresh_crit_space ) {
+      print "$CHECK_NAME CRITICAL - Excessive paging space utilization.  There is not a tremendous amount of paging activity occuring, so performance is not affected, but lots of the paging space is in use.  The machine may crash if all the paging space becomes filled.  $common_output_data | $perf_data \n";
+      exit $CRITICAL;						#exit script
+   }								 
+   if ( ($pagingutil > $thresh_warn_space) && ($pagingutil <= $thresh_crit_space) ) {
+      print "$CHECK_NAME WARN     - Excessive paging space utilization.  There is not a tremendous amount of paging activity occuring, so performance is not affected, but lots of the paging space is in use.  The machine may crash if all the paging space becomes filled.  $common_output_data | $perf_data \n";
+      exit $WARN;						#exit script
+   }								 
+   #
+   # Send an alert if paging space size is less than real memory (unless there is more than 32GB real memory)
+   #
+   if ( $pagingspace < $realmemory ) {
+      if ( $realmemory <= 32768) {
+         print "$CHECK_NAME WARN - ${pagingspace}MB paging space is less than ${realmemory}MB real memory.  Please increase paging space with chps command.   $common_output_data | $perf_data \n";
+         exit $WARN;						#exit script
+      }								#end of if block
+   }								#end of if block
+   #
+   # Confirm the hd6 paging space exists
+   #
+   unless ($pagefiles{hd6}{name}) {
+      print "$CHECK_NAME WARN - cannot find the hd6 paging space, which must exist in order for mksysb restores to function.  Please create the hd6 paging space.   $common_output_data | $perf_data \n";
+      exit $WARN;						#exit script
+   } 								#end of unless block
+   #
+   #
+   # Send an alert if the hd6 paging space size is less than 512MB.  This causes problems on mksysb restores.
+   #
+   unless ($pagefiles{hd6}{name}) {
+   } 								#end of unless block
+   if ( $pagefiles{hd6}{size} < 512 ) {
+      print "$CHECK_NAME WARN - the hd6 paging space must be at least 512MB in size, or mksysb restores may fail.  Please increase the size of the hd6 paging space to at least 512MB.   $common_output_data | $perf_data \n";
+      exit $WARN;						#exit script
+   }								#end of if block
+   #
+   #
+   # Send an alert if there are paging spaces located on volume groups other than rootvg
+   # It is possible to have paging spaces in any volume group, but mksysb restores are much simpler if all the paging spaces are in rootvg.
+   # Back in the days of servers with only internal disks, it was sometimes considered a good idea to spread the paging space over multiple physical disks to get better performance.
+   # Those days are over.  Nearly all AIX systemas use SAN storage now, so there is no performance benefit in spreading the paging space over multiple disks.
+   # Additionally, having multiple paging spaces makes a restore more complicated, as you now need to restore more than just rootvg.
+   # Bottom line, it is really hard to make a case for putting your paging space anywhere other than rootvg.
+   # 
+   foreach $key (sort keys %pagefiles) {			#loop through for all paging spaces
+      if ( $pagefiles{$key}{volgroup} ne "rootvg" ) {
+         print "$CHECK_NAME WARN - the $pagefiles{$key}{name} paging space is in the $pagefiles{$key}{volgroup} volume group.  All paging spaces should be in the rootvg volume group.   $common_output_data | $perf_data \n";
+         exit $WARN;						#exit script
+      }								#end of if block
+   } 							#end of foreach block
+   #
+   # if we get this far, it means that no problems were detected
+   #
+   print "$CHECK_NAME OK - $common_output_data | $perf_data \n";
+   exit $OK;
+}								#end of subroutine
+
+
+
+
+
+# main body of program
+get_options;
+sanity_checks;
+paging_space_size_sanity_check;
+check_paging_space_util;
+check_pagein_pageout_rate;
+check_volume_groups;
+print_output;
