@@ -4,19 +4,21 @@
 
 # CHANGE LOG
 # ----------
-#  2009/03/09	Nick Jeffrey	Script created
-#  2009/06/19	Nick Jeffrey	Add paging_space_size_sanity_check subroutine
-#  2011/03/05	Nick Jeffrey	Add verbose flag for debugging
-#  2011/03/05	Nick Jeffrey	Fix bug in regexp looking for PP SIZE
-#  2011/03/05	Nick Jeffrey	Add more descriptive warning messages
-#  2012/12/25	Nick Jeffrey	Add nagios perfdata to output
-#  2013/03/22	Nick Jeffrey	If there is more than 32GB of physical memory, do not ask for more than 32GB of paging space
-#  2013/03/22	Nick Jeffrey	Move the pagein/pageout activity alert higher than the paging space consumption alert (more important alerts first)
-#  2013/03/22	Nick Jeffrey	Change alert message if there is high paging space usage but very little actual paging activity
-#  2015/11/09	Nick Jeffrey	Typo in alert message
-#  2016/05/24	Nick Jeffrey	Confirm all paging spaces are located on rootvg
-#  2016/05/24	Nick Jeffrey	Add get_options subroutine
-#  2016/05/24	Nick Jeffrey	Confirm hd6 paging space is at least 512MB
+#  2009/03/09	njeffrey   Script created
+#  2009/06/19	njeffrey	  Add paging_space_size_sanity_check subroutine
+#  2011/03/05	njeffrey	  Add verbose flag for debugging
+#  2011/03/05	njeffrey	  Fix bug in regexp looking for PP SIZE
+#  2011/03/05	njeffrey	  Add more descriptive warning messages
+#  2012/12/25	njeffrey	  Add nagios perfdata to output
+#  2013/03/22	njeffrey   If there is more than 32GB of physical memory, do not ask for more than 32GB of paging space
+#  2013/03/22	njeffrey  	Move the pagein/pageout activity alert higher than the paging space consumption alert (more important alerts first)
+#  2013/03/22	njeffrey   Change alert message if there is high paging space usage but very little actual paging activity
+#  2015/11/09	njeffrey   Typo in alert message
+#  2016/05/24	njeffreyt  Confirm all paging spaces are located on rootvg
+#  2016/05/24	njeffrey   Add get_options subroutine
+#  2016/05/24	njeffrey   Confirm hd6 paging space is at least 512MB
+#  2021/06/27	njeffrey   Documentation updates
+
 
 
 
@@ -39,7 +41,7 @@
 #  file on the nagios server that looks similar to the following.
 #  This assumes that you already have ssh key pairs configured.
 #      define service {
-#              use                             generic-24x7-service
+#              use                             generic-service
 #              hostgroup_name                  all_aix
 #              service_description             AIX paging
 #              check_command                   check_by_ssh!/usr/local/nagios/libexec/check_aix_paging
@@ -49,14 +51,14 @@
 #  Alternatively, if you are using the NRPE method, you should have a section similar to the following in 
 #  the services.cfg file:
 #      define service{
-#               use                             generic-24x7-service
+#               use                             generic-service
 #               hostgroup_name                  all_aix
 #               service_description             AIX paging
 #               check_command                   check_nrpe!check_aix_paging -t 30
 #               notification_options            c,r                     ; Send notifications about critical and recovery events
 #  If you are using the NRPE method, you will also need a command definition similar to the following on each monitored host
 #  in the /usr/local/nagios/nrpe/nrpe.cfg file:
-#      command[check_aix_misc]=/usr/local/nagios/libexec/check_aix_paging
+#      command[check_aix_paging]=/usr/local/nagios/libexec/check_aix_paging
 #
 #
 #
